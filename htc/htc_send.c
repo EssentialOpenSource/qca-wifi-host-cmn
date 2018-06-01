@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2017 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2018 The Linux Foundation. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -179,71 +179,35 @@ void htc_get_control_endpoint_tx_host_credits(HTC_HANDLE HTCHandle,
 
 static inline void restore_tx_packet(HTC_TARGET *target, HTC_PACKET *pPacket)
 {
-	if (pPacket->PktInfo.AsTx.Flags & HTC_TX_PACKET_FLAG_FIXUP_NETBUF) {
-		qdf_nbuf_t netbuf = GET_HTC_PACKET_NET_BUF_CONTEXT(pPacket);
+	qdf_nbuf_t netbuf = GET_HTC_PACKET_NET_BUF_CONTEXT(pPacket);
 
+	if (pPacket->PktInfo.AsTx.Flags & HTC_TX_PACKET_FLAG_FIXUP_NETBUF) {
 		qdf_nbuf_unmap(target->osdev, netbuf, QDF_DMA_TO_DEVICE);
-		qdf_nbuf_pull_head(netbuf, sizeof(HTC_FRAME_HDR));
 		pPacket->PktInfo.AsTx.Flags &= ~HTC_TX_PACKET_FLAG_FIXUP_NETBUF;
 	}
 
-}
-
-static void do_send_completion(HTC_ENDPOINT *pEndpoint,
-			       HTC_PACKET_QUEUE *pQueueToIndicate)
-{
-	do {
-
-		if (HTC_QUEUE_EMPTY(pQueueToIndicate)) {
-			/* nothing to indicate */
-			break;
-		}
-
-		if (pEndpoint->EpCallBacks.EpTxCompleteMultiple != NULL) {
-			AR_DEBUG_PRINTF(ATH_DEBUG_SEND,
-					("HTC calling ep %d, send complete multiple callback (%d pkts)\n",
-					 pEndpoint->Id,
-					 HTC_PACKET_QUEUE_DEPTH
-						 (pQueueToIndicate)));
-			/* a multiple send complete handler is being used, pass
-			 * the queue to the handler
-			 */
-			pEndpoint->EpCallBacks.EpTxCompleteMultiple(
-						pEndpoint->EpCallBacks.pContext,
-						pQueueToIndicate);
-			/* all packets are now owned by the callback, reset
-			 * queue to be safe
-			 */
-			INIT_HTC_PACKET_QUEUE(pQueueToIndicate);
-		} else {
-			HTC_PACKET *pPacket;
-			/* using legacy EpTxComplete */
-			do {
-				pPacket = htc_packet_dequeue(pQueueToIndicate);
-				AR_DEBUG_PRINTF(ATH_DEBUG_SEND,
-						("HTC calling ep %d send complete callback on packet %pK\n",
-						 pEndpoint->Id, pPacket));
-				pEndpoint->EpCallBacks.EpTxComplete(pEndpoint->
-								    EpCallBacks.
-								    pContext,
-								    pPacket);
-			} while (!HTC_QUEUE_EMPTY(pQueueToIndicate));
-		}
-
-	} while (false);
-
+	qdf_nbuf_pull_head(netbuf, sizeof(HTC_FRAME_HDR));
 }
 
 static void send_packet_completion(HTC_TARGET *target, HTC_PACKET *pPacket)
 {
 	HTC_ENDPOINT *pEndpoint = &target->endpoint[pPacket->Endpoint];
-	HTC_PACKET_QUEUE container;
+	HTC_EP_SEND_PKT_COMPLETE EpTxComplete;
 
 	restore_tx_packet(target, pPacket);
-	INIT_HTC_PACKET_QUEUE_AND_ADD(&container, pPacket);
 
 	/* do completion */
-	do_send_completion(pEndpoint, &container);
+	AR_DEBUG_PRINTF(ATH_DEBUG_SEND,
+			("HTC calling ep %d send complete callback on packet %pK\n",
+			 pEndpoint->Id, pPacket));
+
+	EpTxComplete = pEndpoint->EpCallBacks.EpTxComplete;
+	if (EpTxComplete != NULL)
+		EpTxComplete(pEndpoint->EpCallBacks.pContext, pPacket);
+	else
+		qdf_nbuf_free(pPacket->pPktContext);
+
+
 }
 
 void htc_send_complete_check_cleanup(void *context)
@@ -423,6 +387,7 @@ static QDF_STATUS htc_send_bundled_netbuf(HTC_TARGET *target,
 			       pEndpoint->Id, HTC_TX_PACKET_TAG_BUNDLED);
 	LOCK_HTC_TX(target);
 	HTC_PACKET_ENQUEUE(&pEndpoint->TxLookupQueue, pPacketTx);
+	pEndpoint->ul_outstanding_cnt++;
 	UNLOCK_HTC_TX(target);
 #if DEBUG_BUNDLE
 	qdf_print(" Send bundle EP%d buffer size:0x%x, total:0x%x, count:%d.\n",
@@ -664,23 +629,21 @@ static QDF_STATUS htc_issue_packets(HTC_TARGET *target,
 			 * Now that the HTC frame header has been added, the
 			 * netbuf can be mapped.  This only applies to non-data
 			 * frames, since data frames were already mapped as they
-			 * entered into the driver. Check the "FIXUP_NETBUF"
-			 * flag to see whether this is a data netbuf that is
-			 * already mapped, or a non-data netbuf that needs to be
-			 * mapped.
+			 * entered into the driver.
 			 */
-			if (pPacket->PktInfo.AsTx.
-			    Flags & HTC_TX_PACKET_FLAG_FIXUP_NETBUF) {
-				ret = qdf_nbuf_map(target->osdev,
-					GET_HTC_PACKET_NET_BUF_CONTEXT
-						(pPacket), QDF_DMA_TO_DEVICE);
-				if (ret != QDF_STATUS_SUCCESS) {
-					AR_DEBUG_PRINTF(ATH_DEBUG_ERR,
-						("%s nbuf Map Fail Endpnt %pK\n",
-						__func__, pEndpoint));
-					status = QDF_STATUS_E_FAILURE;
-					break;
-				}
+			pPacket->PktInfo.AsTx.Flags |=
+				HTC_TX_PACKET_FLAG_FIXUP_NETBUF;
+
+			ret = qdf_nbuf_map(target->osdev,
+				GET_HTC_PACKET_NET_BUF_CONTEXT(pPacket),
+				QDF_DMA_TO_DEVICE);
+			if (ret != QDF_STATUS_SUCCESS) {
+				AR_DEBUG_PRINTF(ATH_DEBUG_ERR,
+					("%s nbuf Map Fail Endpnt %pK\n",
+					__func__, pEndpoint));
+				HTC_PACKET_ENQUEUE_TO_HEAD(pPktQueue, pPacket);
+				status = QDF_STATUS_E_FAILURE;
+				break;
 			}
 		}
 		LOCK_HTC_TX(target);
@@ -719,6 +682,9 @@ static QDF_STATUS htc_issue_packets(HTC_TARGET *target,
 						("hif_send Failed status:%d\n",
 						 status));
 			}
+			qdf_nbuf_unmap(target->osdev,
+				GET_HTC_PACKET_NET_BUF_CONTEXT(pPacket),
+				QDF_DMA_TO_DEVICE);
 			LOCK_HTC_TX(target);
 			target->ce_send_cnt--;
 			pEndpoint->ul_outstanding_cnt--;
@@ -1445,7 +1411,14 @@ static inline QDF_STATUS __htc_send_pkt(HTC_HANDLE HTCHandle,
 		return QDF_STATUS_E_INVAL;
 	}
 
-	AR_DEBUG_ASSERT(pPacket->Endpoint < ENDPOINT_MAX);
+	if ((pPacket->Endpoint >= ENDPOINT_MAX) ||
+	    (pPacket->Endpoint <= ENDPOINT_UNUSED)) {
+		AR_DEBUG_PRINTF(ATH_DEBUG_SEND, ("%s endpoint is invalid\n",
+				__func__));
+		AR_DEBUG_ASSERT(0);
+		return QDF_STATUS_E_INVAL;
+	}
+
 	pEndpoint = &target->endpoint[pPacket->Endpoint];
 
 	if (!pEndpoint->service_id) {
@@ -1483,22 +1456,24 @@ static inline QDF_STATUS __htc_send_pkt(HTC_HANDLE HTCHandle,
 		       HTC_FRAME_HDR_CONTROLBYTES1));
 
 	UNLOCK_HTC_TX(target);
-	/*
-	 * Now that the HTC frame header has been added, the netbuf can
-	 * be mapped.  This only applies to non-data frames, since data
-	 * frames were already mapped as they entered into the driver.
-	 */
-	status = qdf_nbuf_map(target->osdev,
-			      GET_HTC_PACKET_NET_BUF_CONTEXT(pPacket),
-			      QDF_DMA_TO_DEVICE);
-	if (status != QDF_STATUS_SUCCESS) {
-		AR_DEBUG_PRINTF(ATH_DEBUG_ERR,
-				("%s: nbuf map failed, endpoint %pK, seq_no. %d\n",
-				 __func__, pEndpoint, pEndpoint->SeqNo));
-		return status;
-	}
 
-	pPacket->PktInfo.AsTx.Flags |= HTC_TX_PACKET_FLAG_FIXUP_NETBUF;
+	/*
+	 * For flow control enabled endpoints mapping is done in
+	 * htc_issue_packets and for non flow control enabled endpoints
+	 * its done here.
+	 */
+	if (!IS_TX_CREDIT_FLOW_ENABLED(pEndpoint)) {
+		pPacket->PktInfo.AsTx.Flags |= HTC_TX_PACKET_FLAG_FIXUP_NETBUF;
+		status = qdf_nbuf_map(target->osdev,
+				      GET_HTC_PACKET_NET_BUF_CONTEXT(pPacket),
+				      QDF_DMA_TO_DEVICE);
+		if (status != QDF_STATUS_SUCCESS) {
+			AR_DEBUG_PRINTF(ATH_DEBUG_ERR,
+					("%s: nbuf map failed, endpoint %pK, seq_no. %d\n",
+					 __func__, pEndpoint, pEndpoint->SeqNo));
+			return status;
+		}
+	}
 
 	INIT_HTC_PACKET_QUEUE_AND_ADD(&pPktQueue, pPacket);
 #ifdef USB_HIF_SINGLE_PIPE_DATA_SCHED
@@ -1511,20 +1486,15 @@ static inline QDF_STATUS __htc_send_pkt(HTC_HANDLE HTCHandle,
 #endif
 
 	/* do completion on any packets that couldn't get in */
-	if (!HTC_QUEUE_EMPTY(&pPktQueue)) {
+	while (!HTC_QUEUE_EMPTY(&pPktQueue)) {
+		pPacket = htc_packet_dequeue(&pPktQueue);
 
-		HTC_PACKET_QUEUE_ITERATE_ALLOW_REMOVE(&pPktQueue, pPacket) {
-			/* remove the headroom reserved for HTC_FRAME_HDR */
-			restore_tx_packet(target, pPacket);
+		if (HTC_STOPPING(target))
+			pPacket->Status = QDF_STATUS_E_CANCELED;
+		else
+			pPacket->Status = QDF_STATUS_E_RESOURCES;
 
-			if (HTC_STOPPING(target))
-				pPacket->Status = QDF_STATUS_E_CANCELED;
-			else
-				pPacket->Status = QDF_STATUS_E_RESOURCES;
-		}
-		HTC_PACKET_QUEUE_ITERATE_END;
-
-		do_send_completion(pEndpoint, &pPktQueue);
+		send_packet_completion(target, pPacket);
 	}
 
 	AR_DEBUG_PRINTF(ATH_DEBUG_SEND, ("-__htc_send_pkt\n"));
@@ -1535,8 +1505,17 @@ static inline QDF_STATUS __htc_send_pkt(HTC_HANDLE HTCHandle,
 /* HTC API - htc_send_pkt */
 QDF_STATUS htc_send_pkt(HTC_HANDLE HTCHandle, HTC_PACKET *pPacket)
 {
-	if (HTCHandle == NULL || pPacket == NULL)
+	if (HTCHandle == NULL) {
+		AR_DEBUG_PRINTF(ATH_DEBUG_ERR,
+				("%s: HTCHandle is NULL \n", __func__));
 		return QDF_STATUS_E_FAILURE;
+	}
+
+	if (pPacket == NULL) {
+		AR_DEBUG_PRINTF(ATH_DEBUG_ERR,
+				("%s: pPacket is NULL \n", __func__));
+		return QDF_STATUS_E_FAILURE;
+	}
 
 	AR_DEBUG_PRINTF(ATH_DEBUG_SEND,
 			("+-htc_send_pkt: Enter endPointId: %d, buffer: %pK, length: %d\n",
@@ -2215,16 +2194,16 @@ void htc_process_credit_rpt(HTC_TARGET *target, HTC_CREDIT_REPORT *pRpt,
 
 #endif
 
-		pEndpoint->TxCredits += rpt_credits;
-
 		if (pEndpoint->service_id == WMI_CONTROL_SVC) {
 			LOCK_HTC_CREDIT(target);
 			htc_credit_record(HTC_PROCESS_CREDIT_REPORT,
-					  pEndpoint->TxCredits,
+					  pEndpoint->TxCredits + rpt_credits,
 					  HTC_PACKET_QUEUE_DEPTH(&pEndpoint->
 								 TxQueue));
 			UNLOCK_HTC_CREDIT(target);
 		}
+
+		pEndpoint->TxCredits += rpt_credits;
 
 		if (pEndpoint->TxCredits
 		    && HTC_PACKET_QUEUE_DEPTH(&pEndpoint->TxQueue)) {

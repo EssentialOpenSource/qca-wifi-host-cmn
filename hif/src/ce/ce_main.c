@@ -2363,16 +2363,6 @@ static inline void hif_post_static_buf_to_target(struct hif_softc *scn)
 }
 #endif
 
-#ifdef WLAN_SUSPEND_RESUME_TEST
-static void hif_fake_apps_init_ctx(struct hif_softc *scn)
-{
-	INIT_WORK(&scn->fake_apps_ctx.resume_work,
-		  hif_fake_apps_resume_work);
-}
-#else
-static inline void hif_fake_apps_init_ctx(struct hif_softc *scn) {}
-#endif
-
 /**
  * hif_config_ce() - configure copy engines
  * @scn: hif context
@@ -2696,6 +2686,7 @@ void *hif_ce_get_lro_ctx(struct hif_opaque_softc *hif_hdl, int ctx_id)
 
 	return ce_state->lro_data;
 }
+#endif
 
 /**
  * ce_lro_flush_cb_register() - register the LRO flush
@@ -2774,7 +2765,6 @@ int ce_lro_flush_cb_deregister(struct hif_opaque_softc *hif_hdl,
 	}
 	return rc;
 }
-#endif
 
 /**
  * hif_map_service_to_pipe() - returns  the ce ids pertaining to
